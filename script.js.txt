@@ -1,0 +1,736 @@
+// ==========================
+// MQTT DATA SOURCE
+// ==========================
+
+// Browser connects to HiveMQ broker using secure WebSocket.
+// Monitoring Station publishes to broker.hivemq.com on MQTT port 1883.
+// Browser reads from the same broker using WebSocket port 8884.
+const MQTT_BROKER_URL = "wss://broker.hivemq.com:8884/mqtt";
+
+// This must match the topic in your Monitoring Station code.
+const MQTT_TOPIC = "student-demo-982734/wemos1/sensors";
+
+// Monitoring Station is publishing every 500 ms.
+// With MQTT, browser polling is not needed.
+// Browser updates whenever a new MQTT message arrives.
+const MAX_CHART_POINTS = 40;
+
+let mqttClient;
+
+// ==========================
+// EMAILJS INITIALIZATION
+// ==========================
+
+// Keep this for future use.
+// Replace YOUR_PUBLIC_KEY only if you want EmailJS alerts.
+if (typeof emailjs !== "undefined") {
+    emailjs.init("YOUR_PUBLIC_KEY");
+}
+
+// ==========================
+// THRESHOLD CONFIGURATION
+// ==========================
+
+const thresholds = {
+    envTemperature: 45,
+    loadTemperature: 60,
+    vibration: 600,
+    humidity: 90,
+    pressureLow: 950,
+    pressureHigh: 1100,
+    mq02: 180
+};
+
+let alertTriggered = false;
+
+// Health distribution counters are based on received normal/warning packets.
+let normalPacketCounter = 0;
+let warningPacketCounter = 0;
+
+// ==========================
+// FAILURE PREDICTION
+// ==========================
+
+function clampNumber(value, minValue, maxValue) {
+    return Math.min(Math.max(value, minValue), maxValue);
+}
+
+function highRiskScore(value, warningLimit, criticalLimit) {
+    if (warningLimit <= 0) return 0;
+
+    if (value <= warningLimit) {
+        return clampNumber((value / warningLimit) * 35, 0, 35);
+    }
+
+    return clampNumber(35 + ((value - warningLimit) / (criticalLimit - warningLimit)) * 65, 35, 100);
+}
+
+function pressureRiskScore(pressure) {
+    if (pressure >= thresholds.pressureLow && pressure <= thresholds.pressureHigh) {
+        return 0;
+    }
+
+    const deviation = pressure < thresholds.pressureLow
+        ? thresholds.pressureLow - pressure
+        : pressure - thresholds.pressureHigh;
+
+    return clampNumber(35 + deviation * 1.5, 35, 100);
+}
+
+function setRiskDisplay(percent) {
+    document.getElementById("failureProb").innerText = percent.toFixed(1) + "%";
+
+    let risk = "LOW";
+    let color = "#00ff9d";
+
+    if (percent >= 75) {
+        risk = "HIGH";
+        color = "#ff0000";
+    } else if (percent >= 50) {
+        risk = "MEDIUM";
+        color = "#ffcc00";
+    }
+
+    document.getElementById("riskLevel").innerText = risk;
+    document.getElementById("riskLevel").style.color = color;
+}
+
+function predictFailure(loadTemp, vibration, humidity, pressure, mq02) {
+    // Deterministic risk score. This avoids the old untrained TensorFlow model,
+    // which could stay around 50% even during normal operation.
+    const loadScore = highRiskScore(loadTemp, thresholds.loadTemperature, thresholds.loadTemperature + 10);
+    const vibScore = highRiskScore(vibration, thresholds.vibration, thresholds.vibration + 200);
+    const humScore = highRiskScore(humidity, thresholds.humidity, thresholds.humidity + 10);
+    const mq02Score = highRiskScore(mq02, thresholds.mq02, thresholds.mq02 + 100);
+    const pressureScore = pressureRiskScore(pressure);
+
+    const percent = clampNumber(
+        (loadScore * 0.25) +
+        (vibScore * 0.25) +
+        (mq02Score * 0.20) +
+        (humScore * 0.15) +
+        (pressureScore * 0.15),
+        0,
+        100
+    );
+
+    setRiskDisplay(percent);
+    return Number(percent.toFixed(1));
+}
+
+// ==========================
+// INDUSTRIAL GRID UPDATE
+// ==========================
+
+function updateRow(id, value, statusText, statusClass) {
+    const row = document.getElementById(id);
+
+    if (!row) return;
+
+    const valueCell = row.querySelector(".value");
+    const statusCell = row.querySelector(".status");
+
+    valueCell.innerText = value;
+
+    valueCell.classList.add("pulse");
+    setTimeout(() => valueCell.classList.remove("pulse"), 600);
+
+    statusCell.innerText = statusText;
+    statusCell.className = "status " + statusClass;
+}
+
+function getHighStatus(value, warningLimit, criticalLimit) {
+    if (value > criticalLimit) {
+        return {
+            text: "CRITICAL",
+            cls: "critical"
+        };
+    }
+
+    if (value > warningLimit) {
+        return {
+            text: "WARNING",
+            cls: "warning"
+        };
+    }
+
+    return {
+        text: "NORMAL",
+        cls: "normal"
+    };
+}
+
+function getRangeStatus(value, lowLimit, highLimit) {
+    if (value < lowLimit || value > highLimit) {
+        return {
+            text: "WARNING",
+            cls: "warning"
+        };
+    }
+
+    return {
+        text: "NORMAL",
+        cls: "normal"
+    };
+}
+
+function getMQ02Status(mq02) {
+    return getHighStatus(
+        mq02,
+        thresholds.mq02,
+        thresholds.mq02 + 100
+    );
+}
+
+// ==========================
+// INDIVIDUAL SENSOR CHARTS
+// ==========================
+
+function makeGradient(ctx, color1, color2) {
+    const gradient = ctx.createLinearGradient(0, 0, 0, 220);
+    gradient.addColorStop(0, color1);
+    gradient.addColorStop(1, color2);
+    return gradient;
+}
+
+function createSensorChart(canvasId, label, lineColor, fillColor) {
+    const canvas = document.getElementById(canvasId);
+
+    if (!canvas) return null;
+
+    const ctx = canvas.getContext("2d");
+
+    return new Chart(ctx, {
+        type: "line",
+        data: {
+            labels: [],
+            datasets: [
+                {
+                    label: label,
+                    data: [],
+                    borderColor: lineColor,
+                    backgroundColor: makeGradient(ctx, fillColor, "rgba(0, 0, 0, 0)"),
+                    borderWidth: 2,
+                    fill: true,
+                    tension: 0.35,
+                    pointRadius: 0,
+                    pointHoverRadius: 4
+                }
+            ]
+        },
+        options: {
+            responsive: true,
+            maintainAspectRatio: false,
+            animation: false,
+            plugins: {
+                legend: {
+                    display: false
+                },
+                tooltip: {
+                    mode: "index",
+                    intersect: false
+                }
+            },
+            scales: {
+                x: {
+                    grid: {
+                        color: "rgba(255, 255, 255, 0.06)"
+                    },
+                    ticks: {
+                        color: "rgba(255, 255, 255, 0.75)",
+                        maxTicksLimit: 5
+                    }
+                },
+                y: {
+                    beginAtZero: true,
+                    grid: {
+                        color: "rgba(255, 255, 255, 0.08)"
+                    },
+                    ticks: {
+                        color: "rgba(255, 255, 255, 0.75)",
+                        maxTicksLimit: 5
+                    }
+                }
+            }
+        }
+    });
+}
+
+const sensorCharts = {
+    envTemp: createSensorChart("tempChart", "Temperature °C", "#00ffcc", "rgba(0, 255, 204, 0.28)"),
+    humidity: createSensorChart("humChart", "Humidity %", "#00bfff", "rgba(0, 191, 255, 0.28)"),
+    pressure: createSensorChart("presChart", "Pressure hPa", "#ff6b6b", "rgba(255, 107, 107, 0.28)"),
+    mq02: createSensorChart("mq02Chart", "MQ02", "#9b59b6", "rgba(155, 89, 182, 0.30)"),
+    loadTemp: createSensorChart("loadTempChart", "Load Temperature °C", "#ffcc00", "rgba(255, 204, 0, 0.28)"),
+    vibration: createSensorChart("vibChart", "Vibration", "#ff4444", "rgba(255, 68, 68, 0.28)")
+};
+
+function pushChartPoint(chart, label, value) {
+    if (!chart) return;
+
+    if (chart.data.labels.length >= MAX_CHART_POINTS) {
+        chart.data.labels.shift();
+        chart.data.datasets[0].data.shift();
+    }
+
+    chart.data.labels.push(label);
+    chart.data.datasets[0].data.push(value);
+    chart.update();
+}
+
+function setChartValue(id, value) {
+    const element = document.getElementById(id);
+
+    if (element) {
+        element.innerText = value;
+    }
+}
+
+function updateChart(envTemp, loadTemp, vibration, humidity, pressure, mq02) {
+    const timeLabel = new Date().toLocaleTimeString();
+
+    pushChartPoint(sensorCharts.envTemp, timeLabel, envTemp);
+    pushChartPoint(sensorCharts.humidity, timeLabel, humidity);
+    pushChartPoint(sensorCharts.pressure, timeLabel, pressure);
+    pushChartPoint(sensorCharts.mq02, timeLabel, mq02);
+    pushChartPoint(sensorCharts.loadTemp, timeLabel, loadTemp);
+    pushChartPoint(sensorCharts.vibration, timeLabel, vibration);
+
+    setChartValue("tempChartValue", envTemp.toFixed(1) + " °C");
+    setChartValue("humChartValue", humidity.toFixed(1) + " %");
+    setChartValue("presChartValue", pressure.toFixed(1) + " hPa");
+    setChartValue("mq02ChartValue", mq02.toFixed(0));
+    setChartValue("loadTempChartValue", loadTemp.toFixed(1) + " °C");
+    setChartValue("vibChartValue", vibration.toFixed(0));
+}
+
+// ==========================
+// PIE CHART
+// ==========================
+
+const pieCtx = document.getElementById("pieChart").getContext("2d");
+
+const pieChart = new Chart(pieCtx, {
+    type: "doughnut",
+    data: {
+        labels: ["Normal Packets", "Warning Packets"],
+        datasets: [
+            {
+                data: [0, 0],
+                backgroundColor: ["#00ff9d", "#ff4444"],
+                borderColor: "rgba(255, 255, 255, 0.12)",
+                borderWidth: 1,
+                hoverOffset: 8
+            }
+        ]
+    },
+    options: {
+        responsive: true,
+        maintainAspectRatio: false,
+        cutout: "62%",
+        plugins: {
+            legend: {
+                position: "right",
+                labels: {
+                    color: "white",
+                    usePointStyle: true,
+                    pointStyle: "circle",
+                    padding: 14
+                }
+            },
+            tooltip: {
+                callbacks: {
+                    label: function (context) {
+                        const total = normalPacketCounter + warningPacketCounter;
+                        const value = Number(context.raw || 0);
+                        const ratio = total > 0 ? ((value / total) * 100).toFixed(1) : "0.0";
+                        return context.label + ": " + value + " packets (" + ratio + "%)";
+                    }
+                }
+            }
+        }
+    }
+});
+
+function setText(id, value) {
+    const element = document.getElementById(id);
+    if (element) element.innerText = value;
+}
+
+function refreshHealthDistribution() {
+    const total = normalPacketCounter + warningPacketCounter;
+    const warningRatio = total > 0 ? ((warningPacketCounter / total) * 100) : 0;
+
+    pieChart.data.datasets[0].data = total > 0
+        ? [normalPacketCounter, warningPacketCounter]
+        : [1, 0];
+
+    setText("normalPacketCount", normalPacketCounter);
+    setText("warningPacketCount", warningPacketCounter);
+    setText("warningPacketRatio", warningRatio.toFixed(1) + "%");
+
+    pieChart.update();
+}
+
+function updatePieChart(warn) {
+    if (warn === 1) {
+        warningPacketCounter++;
+    } else {
+        normalPacketCounter++;
+    }
+
+    refreshHealthDistribution();
+}
+
+// ==========================
+// ALERT LOGGING SYSTEM
+// ==========================
+
+const MAX_STORED_LOGS = 40;
+
+function formatLogValue(value, digits = 1) {
+    const numberValue = Number(value);
+
+    if (Number.isNaN(numberValue)) {
+        return value;
+    }
+
+    return numberValue.toFixed(digits);
+}
+
+function logAlert(severity, envTemp, loadTemp, vibration, humidity, pressure, mq02) {
+    let logs = JSON.parse(localStorage.getItem("logs")) || [];
+
+    const entry = {
+        time: new Date().toLocaleString(),
+        severity,
+        envTemp,
+        loadTemp,
+        vibration,
+        humidity,
+        pressure,
+        mq02
+    };
+
+    logs.unshift(entry);
+    logs = logs.slice(0, MAX_STORED_LOGS);
+
+    localStorage.setItem("logs", JSON.stringify(logs));
+    renderLogs(logs);
+}
+
+function displayLog(data) {
+    const list = document.getElementById("alertLogList");
+
+    if (!list) return;
+
+    const row = document.createElement("div");
+    const severityClass = String(data.severity || "").toLowerCase().includes("critical") ? "critical" : "warning";
+
+    row.className = "alert-log-item " + severityClass;
+
+    row.innerHTML = `
+        <div class="log-main">
+            <span class="log-severity">${data.severity}</span>
+            <span class="log-time">${data.time}</span>
+        </div>
+
+        <div class="log-values">
+            <span>T <b>${formatLogValue(data.envTemp)}</b> °C</span>
+            <span>H <b>${formatLogValue(data.humidity)}</b> %</span>
+            <span>P <b>${formatLogValue(data.pressure)}</b> hPa</span>
+            <span>MQ02 <b>${formatLogValue(data.mq02, 0)}</b></span>
+            <span>Load <b>${formatLogValue(data.loadTemp)}</b> °C</span>
+            <span>Vib <b>${formatLogValue(data.vibration, 0)}</b></span>
+        </div>
+    `;
+
+    list.appendChild(row);
+}
+
+function renderLogs(logs) {
+    const list = document.getElementById("alertLogList");
+
+    if (!list) return;
+
+    list.innerHTML = "";
+
+    if (!logs || logs.length === 0) {
+        list.innerHTML = '<div class="empty-log">No alerts recorded yet.</div>';
+        return;
+    }
+
+    logs.forEach(log => {
+        displayLog(log);
+    });
+}
+
+function loadLogs() {
+    const logs = JSON.parse(localStorage.getItem("logs")) || [];
+    renderLogs(logs.slice(0, MAX_STORED_LOGS));
+}
+
+function resetDashboardStatus() {
+    const status = document.getElementById("status");
+    const arduinoWarn = document.getElementById("arduinoWarn");
+    const arduinoState = document.getElementById("arduinoState");
+
+    if (status) {
+        status.innerText = "Normal Operation";
+        status.style.color = "#00ff9d";
+    }
+
+    if (arduinoWarn) {
+        arduinoWarn.innerText = "0";
+    }
+
+    if (arduinoState) {
+        arduinoState.innerText = "OK";
+        arduinoState.style.color = "#00ff9d";
+    }
+
+    setRiskDisplay(0);
+    alertTriggered = false;
+}
+
+function clearLogs() {
+    localStorage.removeItem("logs");
+    renderLogs([]);
+
+    normalPacketCounter = 0;
+    warningPacketCounter = 0;
+    refreshHealthDistribution();
+
+    resetDashboardStatus();
+}
+
+loadLogs();
+refreshHealthDistribution();
+
+// ==========================
+// ALERT LOGIC
+// ==========================
+
+function checkAlert(prob, warn, envTemp, loadTemp, vibration, humidity, pressure, mq02) {
+    const status = document.getElementById("status");
+    const arduinoWarn = document.getElementById("arduinoWarn");
+    const arduinoState = document.getElementById("arduinoState");
+
+    arduinoWarn.innerText = warn;
+
+    if (warn === 1) {
+        status.innerText = "⚠ WARNING FROM MONITORING STATION";
+        status.style.color = "#ff0000";
+
+        arduinoState.innerText = "WARNING";
+        arduinoState.style.color = "#ff0000";
+
+        if (!alertTriggered) {
+            logAlert("MONITORING STATION WARNING", envTemp, loadTemp, vibration, humidity, pressure, mq02);
+            SMSWarning();
+            alertTriggered = true;
+        }
+
+        return;
+    }
+
+    arduinoState.innerText = "OK";
+    arduinoState.style.color = "#00ff9d";
+
+    if (prob >= 75) {
+        status.innerText = "⚠ CRITICAL FAILURE PREDICTED";
+        status.style.color = "#ff0000";
+
+        if (!alertTriggered) {
+            logAlert("ML CRITICAL", envTemp, loadTemp, vibration, humidity, pressure, mq02);
+            alertTriggered = true;
+        }
+    } else if (prob >= 50) {
+        status.innerText = "⚠ WARNING: RISK DETECTED";
+        status.style.color = "#ffcc00";
+
+        if (!alertTriggered) {
+            logAlert("ML WARNING", envTemp, loadTemp, vibration, humidity, pressure, mq02);
+            alertTriggered = true;
+        }
+    } else {
+        status.innerText = "Normal Operation";
+        status.style.color = "#00ff9d";
+        alertTriggered = false;
+    }
+}
+
+// ==========================
+// MQTT CONNECTION
+// ==========================
+
+function connectMQTT() {
+    const connectionStatus = document.getElementById("connectionStatus");
+
+    if (typeof mqtt === "undefined") {
+        connectionStatus.innerText = "MQTT.js library not loaded";
+        connectionStatus.style.color = "#ff4444";
+        console.log("MQTT.js not found. Check MQTT script tag in index.html");
+        return;
+    }
+
+    const clientId = "browser-dashboard-" + Math.random().toString(16).substring(2, 10);
+
+    connectionStatus.innerText = "Connecting to MQTT Broker...";
+    connectionStatus.style.color = "#ffcc00";
+
+    mqttClient = mqtt.connect(MQTT_BROKER_URL, {
+        clientId: clientId,
+        clean: true,
+        reconnectPeriod: 2000,
+        connectTimeout: 5000
+    });
+
+    mqttClient.on("connect", function () {
+        connectionStatus.innerText = "MQTT Connected. Waiting for Monitoring Station data...";
+        connectionStatus.style.color = "#00ff9d";
+
+        mqttClient.subscribe(MQTT_TOPIC, { qos: 0 }, function (err) {
+            if (err) {
+                connectionStatus.innerText = "MQTT Subscribe Failed";
+                connectionStatus.style.color = "#ff4444";
+                console.log("Subscribe error:", err);
+            } else {
+                console.log("Subscribed to topic:", MQTT_TOPIC);
+            }
+        });
+    });
+
+    mqttClient.on("message", function (topic, message) {
+        try {
+            const rawMessage = message.toString();
+            const data = JSON.parse(rawMessage);
+
+            console.log("MQTT Data:", data);
+
+            updateFromMQTT(data);
+
+        } catch (error) {
+            console.log("MQTT JSON parse error:", error);
+            console.log("Raw message:", message.toString());
+        }
+    });
+
+    mqttClient.on("reconnect", function () {
+        connectionStatus.innerText = "MQTT Reconnecting...";
+        connectionStatus.style.color = "#ffcc00";
+    });
+
+    mqttClient.on("offline", function () {
+        connectionStatus.innerText = "MQTT Offline";
+        connectionStatus.style.color = "#ff4444";
+    });
+
+    mqttClient.on("error", function (error) {
+        connectionStatus.innerText = "MQTT Error";
+        connectionStatus.style.color = "#ff4444";
+        console.log("MQTT Error:", error);
+    });
+}
+
+// ==========================
+// UPDATE DASHBOARD FROM MQTT DATA
+// ==========================
+
+function updateFromMQTT(data) {
+    const connectionStatus = document.getElementById("connectionStatus");
+
+    const envTemp = Number(data.temperature ?? 0);
+    const humidity = Number(data.humidity ?? 0);
+    const pressure = Number(data.pressure ?? 0);
+    const mq02 = Number(data.mq02 ?? 0);
+    const loadTemp = Number(data.load_temperature ?? 0);
+    const vibration = Number(data.vibration ?? 0);
+    const warn = Number(data.warning ?? 0);
+
+    connectionStatus.innerText =
+        "MQTT Live | Sample: " + (data.sample ?? "--") +
+        " | Nano: " + (data.nano_millis ?? "--") + " ms" +
+        " | Station: " + (data.wemos_millis ?? "--") + " ms";
+
+    connectionStatus.style.color = "#00ff9d";
+
+    const envTempStatus = getHighStatus(
+        envTemp,
+        thresholds.envTemperature,
+        thresholds.envTemperature + 10
+    );
+
+    const loadTempStatus = getHighStatus(
+        loadTemp,
+        thresholds.loadTemperature,
+        thresholds.loadTemperature + 10
+    );
+
+    const vibStatus = getHighStatus(
+        vibration,
+        thresholds.vibration,
+        thresholds.vibration + 200
+    );
+
+    const humStatus = getHighStatus(
+        humidity,
+        thresholds.humidity,
+        thresholds.humidity + 10
+    );
+
+    const presStatus = getRangeStatus(
+        pressure,
+        thresholds.pressureLow,
+        thresholds.pressureHigh
+    );
+
+    const mq02Status = getMQ02Status(mq02);
+
+    updateRow("envTempRow", envTemp.toFixed(1), envTempStatus.text, envTempStatus.cls);
+    updateRow("loadTempRow", loadTemp.toFixed(1), loadTempStatus.text, loadTempStatus.cls);
+    updateRow("vibRow", vibration.toFixed(0), vibStatus.text, vibStatus.cls);
+    updateRow("humRow", humidity.toFixed(1), humStatus.text, humStatus.cls);
+    updateRow("presRow", pressure.toFixed(1), presStatus.text, presStatus.cls);
+    updateRow("gasRow", mq02.toFixed(0), mq02Status.text, mq02Status.cls);
+
+    const probability = predictFailure(loadTemp, vibration, humidity, pressure, mq02);
+
+    checkAlert(
+        probability,
+        warn,
+        envTemp,
+        loadTemp,
+        vibration,
+        humidity,
+        pressure,
+        mq02
+    );
+
+    updateChart(
+        envTemp,
+        loadTemp,
+        vibration,
+        humidity,
+        pressure,
+        mq02
+    );
+
+    updatePieChart(warn);
+}
+
+// ==========================
+// SMS / EMAIL WARNING PLACEHOLDER
+// ==========================
+
+function SMSWarning() {
+    // Browser JavaScript cannot directly send SMS by itself.
+    // Later this can call EmailJS, Twilio, or another SMS API.
+    console.log("SMSWarning called");
+}
+
+// ==========================
+// START MQTT LIVE DASHBOARD
+// ==========================
+
+connectMQTT();

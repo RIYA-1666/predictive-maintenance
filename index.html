@@ -1,0 +1,201 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+
+<title>Industrial Predictive Maintenance Dashboard</title>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+
+<!-- MQTT.js library for browser MQTT over WebSocket -->
+<script src="https://cdn.jsdelivr.net/npm/mqtt/dist/mqtt.min.js"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@latest"></script>
+<script src="https://cdn.jsdelivr.net/npm/emailjs-com@3/dist/email.min.js"></script>
+
+<link rel="stylesheet" href="style.css">
+</head>
+
+<body>
+
+<header>
+<h1>Predictive Maintenance with Monitoring Station & MQTT</h1>
+<p>Industrial Machine Health Monitoring System</p>
+<p id="connectionStatus">Connecting to MQTT Broker...</p>
+</header>
+
+<section class="hero">
+<img src="https://images.unsplash.com/photo-1581092580497-e0d23cbdf1dc" alt="Industrial IoT">
+</section>
+
+<section class="dashboard">
+
+<div class="card status-card">
+<h2>Machine Status</h2>
+<p id="status">Normal Operation</p>
+</div>
+
+<div class="card">
+<h2>Monitoring Station Warning Status</h2>
+<p>Warning Flag: <span id="arduinoWarn">0</span></p>
+<p>System State: <span id="arduinoState">OK</span></p>
+</div>
+
+<div class="card">
+<h2>ML Failure Prediction</h2>
+<p>Failure Probability: <span id="failureProb">0%</span></p>
+<p>Risk Level: <span id="riskLevel">LOW</span></p>
+</div>
+
+<div class="card health-card">
+<h2>Health Distribution</h2>
+<div class="health-chart-panel">
+<div class="health-chart-wrap">
+<canvas id="pieChart"></canvas>
+</div>
+<div class="health-stats">
+<div class="health-stat normal-stat">
+<span>Normal Packets</span>
+<strong id="normalPacketCount">0</strong>
+</div>
+<div class="health-stat warning-stat">
+<span>Warning Packets</span>
+<strong id="warningPacketCount">0</strong>
+</div>
+<div class="health-stat ratio-stat">
+<span>Warning Ratio</span>
+<strong id="warningPacketRatio">0%</strong>
+</div>
+</div>
+</div>
+</div>
+
+<div class="card full-card">
+<h2>Real-Time Monitoring Grid</h2>
+<div class="monitor-grid">
+
+<div class="monitor-tile" id="envTempRow">
+<span class="sensor-name">Temperature</span>
+<strong class="value">0</strong>
+<span class="unit">°C</span>
+<span class="status normal">NORMAL</span>
+</div>
+
+<div class="monitor-tile" id="humRow">
+<span class="sensor-name">Humidity</span>
+<strong class="value">0</strong>
+<span class="unit">%</span>
+<span class="status normal">NORMAL</span>
+</div>
+
+<div class="monitor-tile" id="presRow">
+<span class="sensor-name">Pressure</span>
+<strong class="value">0</strong>
+<span class="unit">hPa</span>
+<span class="status normal">NORMAL</span>
+</div>
+
+<div class="monitor-tile" id="gasRow">
+<span class="sensor-name">MQ02</span>
+<strong class="value">0</strong>
+<span class="unit">0-1000</span>
+<span class="status normal">NORMAL</span>
+</div>
+
+<div class="monitor-tile" id="loadTempRow">
+<span class="sensor-name">Load Temperature</span>
+<strong class="value">0</strong>
+<span class="unit">°C</span>
+<span class="status normal">NORMAL</span>
+</div>
+
+<div class="monitor-tile" id="vibRow">
+<span class="sensor-name">Vibration</span>
+<strong class="value">0</strong>
+<span class="unit">1-1000</span>
+<span class="status normal">NORMAL</span>
+</div>
+
+</div>
+</div>
+
+<div class="card full-card">
+<h2>Individual Sensor Trends</h2>
+<div class="chart-grid">
+
+<div class="sensor-chart-card">
+<div class="chart-card-header">
+<span>Temperature</span>
+<strong id="tempChartValue">0.0 °C</strong>
+</div>
+<canvas id="tempChart"></canvas>
+</div>
+
+<div class="sensor-chart-card">
+<div class="chart-card-header">
+<span>Humidity</span>
+<strong id="humChartValue">0.0 %</strong>
+</div>
+<canvas id="humChart"></canvas>
+</div>
+
+<div class="sensor-chart-card">
+<div class="chart-card-header">
+<span>Pressure</span>
+<strong id="presChartValue">0.0 hPa</strong>
+</div>
+<canvas id="presChart"></canvas>
+</div>
+
+<div class="sensor-chart-card">
+<div class="chart-card-header">
+<span>MQ02</span>
+<strong id="mq02ChartValue">0</strong>
+</div>
+<canvas id="mq02Chart"></canvas>
+</div>
+
+<div class="sensor-chart-card">
+<div class="chart-card-header">
+<span>Load Temperature</span>
+<strong id="loadTempChartValue">0.0 °C</strong>
+</div>
+<canvas id="loadTempChart"></canvas>
+</div>
+
+<div class="sensor-chart-card">
+<div class="chart-card-header">
+<span>Vibration</span>
+<strong id="vibChartValue">0</strong>
+</div>
+<canvas id="vibChart"></canvas>
+</div>
+
+</div>
+</div>
+
+
+<div class="card full-card alert-card">
+<div class="alert-header">
+<div>
+<h2>Alert History Logs</h2>
+<p>Newest alerts are shown first. The dashboard keeps the latest 40 logs.</p>
+</div>
+<button class="clear-btn" onclick="clearLogs()">Clear Logs</button>
+</div>
+
+<div id="alertLogList" class="alert-log-list">
+<div class="empty-log">No alerts recorded yet.</div>
+</div>
+</div>
+
+</section>
+
+<footer>
+<p>Final Year Project | IoT Based Predictive Maintenance | MQTT Live Dashboard</p>
+</footer>
+
+<script src="script.js"></script>
+</body>
+</html>
